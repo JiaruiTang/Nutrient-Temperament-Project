@@ -1,0 +1,1673 @@
+---
+title: "Temperament_12_24_Analysis"
+output:
+  pdf_document: default
+  html_document: default
+date: "2023-03-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install Packages
+
+```{r install-pkgs, message=FALSE}
+library(dplyr)
+library(ggcorrplot)
+library(tidyverse)
+library(corrplot)
+library(psych)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(MuMIn)
+library(ggpubr)
+library(cluster)
+library(factoextra)
+library(glmnet)
+library(ggrepel)
+library(bipartite)
+library(fields)
+library(matlab)
+library(gplots)
+library(qgraph)
+library(igraph)
+library(EGAnet)
+library(lavaan)
+```
+
+# Data Preprocessing
+
+## Helper Functions
+
+### Remove Duplicates
+
+```{r rm-dup-helper-func}
+## This function helps remove duplicates in the File 04 dataset
+rm_dup4 = function(df){
+  # remove duplicates
+  rm_child = df %>% group_by(CandID,age,Site.ID) %>%
+    summarise_at(vars(-c(`Project.Abbreviation`,
+                         `Participant.ID`,
+                         `Project.Name`,
+                         `Gender`,
+                         `batch`)), mean) %>% 
+    ungroup()
+  # reorder the data columns
+  new_df = rm_child %>% select(4:(ncol(rm_child)-1),1:3,ncol(rm_child))
+  return(new_df)
+}
+```
+
+### Week Weekend Average
+
+```{r}
+## Average the nutrients by weighting weekend and weekday data from the same week
+week_weight = function(df) {
+  ## Create new variable groupid to show the week index that the data is from
+  df = df %>% group_by(CandID) %>% arrange(age) %>% mutate(diff_day = age - lag(age))
+  df = df %>% mutate(weight=ifelse(weekend==0,5,2)) %>% arrange(CandID, age)
+  groupid = rep(0,nrow(df))
+  for (i in 1:nrow(df)) {
+    if (is.na(df$diff_day[i])) {
+      groupid[i] = 1
+    } else {
+      if (df$diff_day[i]<7){
+        groupid[i] = groupid[i-1]
+      } else{
+        groupid[i] = groupid[i-1]+1
+      }
+    }
+  }
+  df$groupid = groupid
+  ## average nutrient data from the same week index
+  df = df %>% group_by(CandID,groupid,.add = TRUE) %>%
+    summarise(across(Total.Grams:Gluten..g.,weighted.mean,weight),
+              #across(FRU0100:GRS1300,weighted.mean,weight),
+              age=last(age),
+              siteid=names(which.max(table(Site.ID)))) %>% 
+    ungroup()
+  df = df %>% select(Total.Grams:Gluten..g.,CandID,age,siteid,groupid)
+  return(df)
+}
+
+```
+
+### Summarize Rows and Unique CandIDs
+
+```{r summary-func}
+## function to summary the number of records and the number of unique IDs
+row_id_num_summary = function(df) {
+  cat(paste0("\nNumber of rows ", deparse(substitute(df)),": ", nrow(df)),"\n")
+  cat(paste0("\nNumber of unique IDs ",deparse(substitute(df)),": ", length(unique(df$CandID))),"\n")
+}
+```
+
+### Detect Outliers
+
+```{r outlier-detect-msd}
+MSD_detect = function(df,num_sd) {
+  mean_df = apply(df,2,median)
+  sd_df = apply(df,2,sd)
+  meanmin = mean_df-(num_sd*sd_df)
+  meanmax = mean_df+(num_sd*sd_df)
+  ids = c()
+  for (i in 1:ncol(df)) {
+    ids = c(ids,which(df[,i]<meanmin[i] | df[,i]>meanmax[i]))
+    if (any(df[,i]<meanmin[i] | df[,i]>meanmax[i])) {
+      print(paste0("columns: ",i))
+      print(paste0("mean values: ", mean_df[i]))
+    }
+    
+  }
+  print(ids)
+  return(list("col_min"=meanmin, "col_max"=meanmax, "id"=ids))
+}
+```
+
+```{r outlier-detect-mad}
+MAD_detect = function(df,num_mad=3) {
+  median_df = apply(df,2,median)
+  #abs_dev = abs(df[]-mean_df[col(df[])])
+  mad_df = apply(df,2,mad)
+  col_min = median_df-(num_mad*mad_df)
+  col_max = median_df+(num_mad*mad_df)
+  ids = c()
+  for (i in 1:(ncol(df)-3)) {
+    ids = c(ids,which(df[,i]<col_min[i] | df[,i]>col_max[i]))
+    if (any(df[,i]<col_min[i] | df[,i]>col_max[i])) {
+      print(paste0("columns: ",i))
+      print(paste0("median values: ", median_df[i]))
+    }
+    
+  }
+  print(ids)
+  return(list("col_min"=col_min, "col_max"=col_max, "id"=ids))
+}
+```
+
+## Read Categorization File
+
+```{r load-category}
+tier2 = read.csv("data/tier2_organize.csv")
+colid = tier2$ColID-1
+new_names = tier2$Comments
+```
+
+## Read Demographic Information
+
+```{r read-demo}
+# Demographic data
+demo = read.csv("data/Demographics_Final_cleaned.csv",skip = 1)
+colnames(demo)[4]="CandID"
+demo_use = demo[,c(4,5,11,20,21,23,25,29)]
+demo_use$Sex = as.factor(demo_use$Sex)
+demo_use$Delivery.Method = as.factor(demo_use$Delivery.Method)
+demo_use$Participant.Ethnicity. = as.factor(demo_use$Participant.Ethnicity.)
+demo_use$Participant.Race. = as.factor(demo_use$Participant.Race.)
+demo_use$Education.Level = as.factor(demo_use$Education.Level)
+demo_use$Education.Level.1 = as.factor(demo_use$Education.Level.1)
+demo_use$Household.Income.=as.factor(demo_use$Household.Income.)
+str(demo_use)
+```
+
+## Read Temperament Scores
+
+```{r load-mullen-file, results='hold'}
+## Read Latent Temperatment Score File
+bqfc = read.csv("data/BQ_FC.csv")
+
+## Remove NAs in columns Age
+bqfc = na.omit(bqfc,cols = "Age")
+bqfc$Age = bqfc$Age*30
+
+## Summarize the Number of Records
+#View(bqfc)
+nrow(bqfc)
+length(unique(bqfc$PID))
+```
+
+## Read File 04
+
+```{r import-file04-summary, results='asis'}
+## Load File 04 Data
+file04 = read.csv("data/total.csv")
+## Filter out children between 1 to 3 years
+file04 = file04[which(file04$age>360 & file04$age<=720),]
+## Summarize the Number of Records and CandIDs
+row_id_num_summary(file04)
+```
+
+## File04 Data Clean
+
+For data from File 04 *total.csv* `file04`, there are several steps to take: 
+
+- Create a new variable indicating whether the day of intake is weekend or not.
+- Remove columns that are not representing nutrients.
+- Remove duplicate records within different batches.
+
+```{r file04-clean, results='asis'}
+## Create `Weekend` Variable to indicate whether the day of intake is weekend
+file04$weekend <- as.integer(ifelse(file04$Day.of.Intake==0 | file04$Day.of.Intake==6, 1, 0))
+select_cols = colnames(file04)[colid]
+## Transfer the lowercase siteid to uppercase
+file04$Site.ID = toupper(file04$Site.ID)
+file04$Site.ID = trimws(file04$Site.ID)
+## Remove columns that are not representing nutrients
+file04_mod = file04[,-c(4:5,7:11,13:17,132:142,151:163,179:182,216:225)]
+## Remove duplicates within different batches
+data_nut12_24 = rm_dup4(file04_mod)
+row_id_num_summary(data_nut12_24)
+```
+
+## Weight Weekend and Weekdays
+
+We are averaging all the nutrient variables by weighting the nutrients taken in weekdays (5/7) and weekends (2/7) in this part and are getting dataframe `data_nut12_24_weighted`.
+
+```{r avg-nutr-wgt-wk, results='asis'}
+data_nut12_24[which(data_nut12_24$Site.ID==""),"Site.ID"]=NA
+data_nut12_24_new = week_weight(data_nut12_24)
+row_id_num_summary(data_nut12_24_new)
+```
+
+## Select Columns
+
+```{r select-cols}
+data_nut12_24_new$energy = data_nut12_24_new$Energy..kcal./1000
+data_nut12_24_tier2 = data_nut12_24_new %>% select(all_of(c(select_cols,"energy","CandID","age","siteid","groupid")))
+row_id_num_summary(data_nut12_24_tier2)
+```
+
+## Rename Columns
+
+```{r rename-col}
+old_names = colnames(data_nut12_24_tier2)[1:(ncol(data_nut12_24_tier2)-5)]
+naming_key <- setNames(object = select_cols, nm = new_names)
+data_nut12_24_rename = data_nut12_24_tier2 %>% rename(any_of(naming_key))
+```
+
+## Drop rows with negative values
+
+```{r}
+data_nut12_24_rename[data_nut12_24_rename<0] <- NA
+row_id_num_summary(data_nut12_24_rename)
+data_nut12_24_rename = na.omit(data_nut12_24_rename)
+row_id_num_summary(data_nut12_24_rename)
+```
+
+## Drop Columns With >10% Zeros
+
+### Calculate Pct of Zeros and Drop Columns
+
+```{r}
+nutrient12_24=data_nut12_24_rename[,1:(ncol(data_nut12_24_rename)-5)]
+res = colSums(nutrient12_24==0)/nrow(nutrient12_24)*100
+res_order = res[order(res,decreasing = TRUE)]
+delete_col = attr(res_order,"names") 
+attr(res_order,"names")=NULL
+## Alcohol larger than 10% Zeros
+data_nut12_24_dl = data_nut12_24_rename[, -which(names(data_nut12_24_rename) %in% delete_col[1:sum(res_order>10,na.rm = TRUE)])]
+data_nut12_24_dl = na.omit(data_nut12_24_dl)
+colnames(data_nut12_24_dl)
+```
+
+
+### Visualize Pct of Zeros
+
+```{r}
+zero_pct_12_24 = res_order
+attr(zero_pct_12_24,"names")=delete_col
+zero_pct_12_24[1:sum(zero_pct_12_24>10,na.rm = TRUE)]
+plot(zero_pct_12_24, main = "Scatter Plot of Proportion of Zeros in Nutrients",
+     ylab = "Proportion of Zeros")
+```
+
+## Data Exploration Before Removing Outliers
+
+```{r}
+#par(ask=TRUE)
+for (i in 1:(ncol(data_nut12_24_dl)-5)) {
+  p = ggplot(data_nut12_24_dl, aes(x=!!sym(colnames(data_nut12_24_dl)[i])))+
+    geom_histogram(bins = 15,fill="white",color="black",linewidth=1)+
+    theme_classic()
+  print(p)
+  #Sys.sleep(2)
+}
+```
+
+## Outlier Detection
+
+Visualize the outliers:
+
+```{r}
+detect_mean12_24 = MAD_detect(data_nut12_24_dl[1:(ncol(data_nut12_24_dl)-5)],5)
+for (i in 1:(ncol(data_nut12_24_dl)-5)) {
+  p = ggplot(data_nut12_24_dl, aes(x=!!sym("age"), y=!!sym(colnames(data_nut12_24_dl)[i]))) +
+    geom_point(size=2) +
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_min[i],color = "red")+
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_max[i],color = "red")+
+    labs(title=paste0("Scatter Plot for ",colnames(data_nut12_24_dl)[i]))+
+    theme_classic()
+  print(p)
+}
+```
+
+```{r}
+a = table(detect_mean12_24$id)
+my_id = sort(a, decreasing = TRUE)
+c = table(my_id)
+barplot(c)
+row_dl = as.numeric(names(my_id[which(my_id>5)]))
+data_nut12_24_dl = data_nut12_24_dl[-row_dl,]
+```
+
+```{r}
+for (i in 1:(ncol(data_nut12_24_dl)-5)) {
+  p = ggplot(data_nut12_24_dl, aes(x=!!sym("age"), y=!!sym(colnames(data_nut12_24_dl)[i]))) +
+    geom_point(size=2) +
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_min[i],color = "red")+
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_max[i],color = "red")+
+    labs(title=paste0("Scatter Plot for ",colnames(data_nut12_24_dl)[i]))+
+    theme_classic()
+  print(p)
+}
+```
+
+
+```{r}
+## Check outliers
+detect_mad12_24_30 = MAD_detect(data_nut12_24_dl[,1:(ncol(data_nut12_24_dl)-5)],30)
+row_id_num_summary(data_nut12_24_dl)
+data_nut12_24_dl = data_nut12_24_dl[-unique(detect_mad12_24_30$id),]
+row_id_num_summary(data_nut12_24_dl)
+```
+
+
+## Data Exploration After Removing Outliers
+
+```{r}
+for (i in 1:(ncol(data_nut12_24_dl)-5)) {
+  p = ggplot(data_nut12_24_dl, aes(x=!!sym(colnames(data_nut12_24_dl)[i])))+
+    geom_histogram(bins = 15,fill="white",color="black",linewidth=1)+theme_classic()
+  print(p)
+  #Sys.sleep(2)
+}
+```
+
+```{r}
+for (i in 1:(ncol(data_nut12_24_dl)-5)) {
+  p = ggplot(data_nut12_24_dl, aes(x=!!sym("age"), y=!!sym(colnames(data_nut12_24_dl)[i]))) +
+    geom_point(size=2) +
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_min[i],color = "red")+
+    geom_abline(slope = 0, intercept = detect_mean12_24$col_max[i],color = "red")+
+    labs(title=paste0("Scatter Plot for ",colnames(data_nut12_24_dl)[i]))+
+    theme_classic()
+  print(p)
+}
+```
+
+## Age Adjusted
+
+```{r}
+data_nut12_24_adj = data_nut12_24_dl
+my_result = matrix(nrow = (ncol(data_nut12_24_dl)-4),ncol = 3)
+for (i in 1:(ncol(data_nut12_24_dl)-4)) {
+  fit_formula = as.formula(paste0(colnames(data_nut12_24_dl)[i],"~age"))
+  fit = lm(fit_formula, data = data_nut12_24_dl)
+  my_result[i,1]=colnames(data_nut12_24_dl)[i]
+  my_result[i,2]=as.numeric(summary(fit)$coefficients[2,1])
+  my_result[i,3]=as.numeric(summary(fit)$coefficients[2,4])
+  if(as.numeric(my_result[i,3])<0.05){
+    data_nut12_24_adj[,i]=as.numeric(fit$residuals)
+    print(colnames(data_nut12_24_adj)[i])
+  }
+}
+colnames(my_result)=c("Nutrient","Estimate","PValue")
+```
+
+## Create Scaled DataFrame
+
+```{r}
+## Scaled Nutrients only
+data_nut12_24_scale = as.matrix(scale(data_nut12_24_adj[,1:(ncol(data_nut12_24_adj)-4)]))
+## Whole Data Set
+data_nut12_24_scale_df = data_nut12_24_adj
+data_nut12_24_scale_df[,1:(ncol(data_nut12_24_adj)-4)]=scale(data_nut12_24_adj[,1:(ncol(data_nut12_24_adj)-4)])
+```
+
+## Correlation
+
+```{r}
+data_nut12_24_corr = cor(data_nut12_24_scale)
+corrplot(data_nut12_24_corr,tl.cex = 0.5,
+         title = paste0("Correlation Matrix of ",ncol(data_nut12_24_scale)," Nutrients for Children 12-24 Months"),
+         mar=c(0,0,1,0))
+```
+
+
+
+## Merge Demographic Data
+
+Merge the demographic data to the cleaned and weighted nutrient data frame `data_nut12_24_weighted`, getting the data frame named `data_nut12_24_demo`. After merging, reorder the nutrients in the order from `Total.Grams` to `Gluten..g.`, from `FRU0100` to `GRS1300`, `CandID`, `age`, `groupid`, from `Sex` to `Household.Income`, from `energy` to `DQI2015_TOTAL_SCORE`.
+
+```{r merge-demo, results='asis'}
+data_nut12_24_demo = merge(data_nut12_24_adj, demo_use, by="CandID", all.x = FALSE,
+                      all.y = FALSE)
+data_nut12_24_demo = data_nut12_24_demo %>%
+  select(SFA4.0:Cholesterol,energy,
+         CandID,age,siteid,groupid,Sex:Household.Income.)
+row_id_num_summary(data_nut12_24_adj)
+row_id_num_summary(data_nut12_24_demo)
+```
+
+## Change Levels
+
+```{r rchange-cat-levels}
+levels(data_nut12_24_demo$Delivery.Method)[levels(
+  data_nut12_24_demo$Delivery.Method)!="Emergency C-Section"&
+    levels(data_nut12_24_demo$Delivery.Method)!="Vaginal"]="Others"
+levels(data_nut12_24_demo$Education.Level)[
+  levels(data_nut12_24_demo$Education.Level)=="Graduate Degree"|
+    levels(data_nut12_24_demo$Education.Level)=="Some Graduate School"]=">grad"
+levels(data_nut12_24_demo$Education.Level)[
+  levels(data_nut12_24_demo$Education.Level)!=">grad"]="<grad"
+levels(data_nut12_24_demo$Education.Level.1)[
+  levels(data_nut12_24_demo$Education.Level.1)=="Graduate Degree"|
+    levels(data_nut12_24_demo$Education.Level.1)=="Some Graduate School"]=">grad"
+levels(data_nut12_24_demo$Education.Level.1)[
+  levels(data_nut12_24_demo$Education.Level.1)!=">grad"]="<grad"
+levels(data_nut12_24_demo$Household.Income.)[
+  levels(data_nut12_24_demo$Household.Income.)=="$25,000 - $34,999"|
+    levels(data_nut12_24_demo$Household.Income.)=="$35,000 - $49,999"|
+    levels(data_nut12_24_demo$Household.Income.)=="$50,000 - $74,999"|
+    levels(data_nut12_24_demo$Household.Income.)=="less than $24,999"]="<75k"
+levels(data_nut12_24_demo$Household.Income.)[
+  levels(data_nut12_24_demo$Household.Income.)=="$75,000 - $99,999"|
+    levels(data_nut12_24_demo$Household.Income.)=="$100,000 - $149,999"]="75k-150k"
+levels(data_nut12_24_demo$Household.Income.)[
+  levels(data_nut12_24_demo$Household.Income.)=="$150,000 - $199,000"|
+    levels(data_nut12_24_demo$Household.Income.)=="over $200,000"]=">150k"
+data_nut12_24_demo$age=as.integer(data_nut12_24_demo$age)
+data_nut12_24_demo$Delivery.Method = relevel(data_nut12_24_demo$Delivery.Method,"Others")
+```
+
+## Read Breastfeeding Information
+
+```{r}
+breastfed = read.csv("data/ChildFeedingPractice_final_cleaned.csv")
+colnames(breastfed)=c("Site","CandID","EverBreastfed","StopBreastmilk","AgeFormulaStart",
+                      "AgeRegularFormula","AgeStopFormula","AgeFedFood",
+                      "DonorBreastmilk","PctDonorBreastmilk","FirstFourMonthBreastfeeding")
+breastfed = breastfed %>% mutate(across(c(StopBreastmilk:AgeFedFood, PctDonorBreastmilk), as.numeric))
+breastfed = breastfed %>% mutate(across(c(EverBreastfed, DonorBreastmilk,
+                                          FirstFourMonthBreastfeeding), as.factor))
+levels(breastfed$FirstFourMonthBreastfeeding)[
+  levels(breastfed$FirstFourMonthBreastfeeding)!="exclusively_breastfed"&
+    levels(breastfed$FirstFourMonthBreastfeeding)!="more_breastmilk"&
+    levels(breastfed$FirstFourMonthBreastfeeding)!="not_answered"]="others"
+```
+
+## Merge Breastfeeding Information
+
+```{r}
+#data_nut12_24_demo = 
+row_id_num_summary(data_nut12_24_demo)
+data_nut12_24_demo = merge(data_nut12_24_demo, 
+                      breastfed %>% select(CandID, FirstFourMonthBreastfeeding), 
+                      by="CandID", all.x = FALSE,
+                      all.y = FALSE)
+row_id_num_summary(data_nut12_24_demo)
+## Reorder the breastfeeding practice factors
+data_nut12_24_demo$FirstFourMonthBreastfeeding = relevel(data_nut12_24_demo$FirstFourMonthBreastfeeding,
+                                                    "others")
+```
+
+# Try Mahalanobis Distance and Multivariate Outlier Detection
+
+```{r}
+data_nut12_24_scale.center = colMeans(data_nut12_24_scale)
+data_nut12_24_scale.cov = cov(data_nut12_24_scale)
+distances = mahalanobis(x = data_nut12_24_scale, 
+                         center = data_nut12_24_scale.center,
+                         cov = data_nut12_24_scale.cov)
+distances_order = distances[order(distances, decreasing = TRUE)]
+ggplot(data = as.data.frame(distances_order),
+       aes(x=c(length(distances_order):1),y=distances_order)) +
+  geom_point()+xlab("index")+
+  ylab("Mahalanobis Distance for Each Observation")+
+  theme_minimal()
+## 469822, 209364, 599, 573
+```
+
+# EGA + CFA
+
+## Helper Functions
+
+Below is the function used to create the EGA cluster and return the list of EGA clusters.
+
+```{r}
+ega_cluster <- function(A){
+  M = cor_auto(A)
+  ega<-EGA(A, plot.EGA = TRUE)
+  temp=ega$dim.variables$dimension
+  group.ega<-list(ega$dim.variables$items[which(temp==1)])
+  for(i in 2:max(temp,na.rm = TRUE))group.ega[[i]]=ega$dim.variables$items[which(temp==i)]
+  if (any(is.na(temp))) {
+    group.ega[[max(temp,na.rm = TRUE)+1]]=which(is.na(temp))
+  }
+  # temp_numeric = as.numeric(temp)
+  # temp_name = attributes(temp)$names
+  # temp_numeric[which(is.na(temp_numeric))]=max(temp,na.rm = TRUE)+1
+  # temp_df = as.data.frame(cbind("nutrients"=temp_name,"cluster"=temp_numeric))
+  # write.csv(M, file = "correlation_24_36months.csv")
+  # write.csv(temp_df, file = "cluster_24_36months.csv")
+  return(list(group.ega, ega))
+}
+```
+
+## Cluster Nutrients
+
+we use the function created to implement graph lasso to our dataset.
+
+```{r}
+#child_24_1_corr = cor(child_24_1_scale)
+data_nut12_24_scale = data_nut12_24_demo[-which(data_nut12_24_demo$CandID %in% c(469822, 209364)),]
+data_nut12_24_scale[,c(2:106)] = scale(data_nut12_24_scale[,c(2:106)])
+ega_12_24 = ega_cluster(data_nut12_24_scale[,c(2:106)])[[1]]
+data_nut12_24_rename = data_nut12_24_scale
+colnames(data_nut12_24_rename)[c(2:106)] = sub("_"," ",sub("_"," ",colnames(data_nut12_24_rename)[c(2:106)]))
+# colnames(data_nut12_24_rename)[c(2:106)] = c("SFA06:00","SFA08:00","SFA10:00","SFA12:00","SFA14:00","SFA16:00","SFA17:00","SFA18:00",
+#                                              "SFA20:00","SFA22:00","MUFA14:01","MUFA16:01","MUFA18:01","MUFA20:01","MUFA22:01",
+#                                              "PUFA18:02","PUFA18:03","PUFA18:04","PUFA20:04","PUFA20:05","PUFA22:05","PUFA22:06",
+#                                              "PUFA18:03n-3","18:01TRANS","18:02TRANS","16:01TRANS","Soluble Dietary Fiber",
+#                                              "Insoluble Dietary Fiber","Pectins","Natural Folate","Synthetic Folate",
+#                                              "CLA cis-9","CLA trans-10","Fructose","Galactose","Glucose","Lactose",
+#                                              "Maltose","Sucrose","Starch","Tryptophan","Threonine","Isoleucine", "Leucine",
+#                                              "Lysine","Methionine","Cystine","Phenylalanine","Tyrosine","Valine","Arginine",
+#                                              "Histidine","Alanine","Aspartic Acid","Glutamic Acid","Glycine","Proline","Serine",
+#                                              "Beta Carotene","Alpha Carotene","Beta Cryptoxanthin","AddSugars AvailableCarbo",
+#                                              "AvailableCarbo","Betaine","Tagatose","Vitamin D2","Vitamin D3","AddedSugars TotalSugar",
+#                                              "Retinol","Lutein Zeaxanthin","Lycopene","Animal Protein","Vegetable Protein","Vitamin E",
+#                                              "Beta Tocopherol","Gamma Tocopherol","Delta Tocopherol","Vitamin K","Vitamin C","Thiamin",
+#                                              "Riboflavin","Niacin","Pantothenic cid","Vitamin B6","Vitamin B12","Calcium","Phosphorus",
+#                                              "Magnesium","Iron","Zinc","Copper","Selenium","Sodium","Potassium","Aspartame",
+#                                              "Saccharin","Caffeine","Phytic Acid","Oxalic Acid","Methylhistidine","Sucrose Polyester",
+#                                              "Ash","Water","Omega3 Fatty Acids","Manganese")
+## Got the EGA_plot.R file further plot
+# We store the name of nutrients in each clusters in to the clusti variable
+for(i in 1:length(ega_12_24))assign(paste0('clust',i),names(ega_12_24[[i]]))
+# print the clusters and we can see that the first, third, fifth cluster have many nutrients
+print(ega_12_24)
+```
+
+Generate the clust file for further membership analysis.
+
+```{r}
+num_clust12_24 = length(ega_12_24)
+clust12_24_list = unlist(ega_12_24)
+num_list12_24 = unlist(lapply(ega_12_24, length))
+clust12_24_df = data.frame(Nutrients=clust12_24_list,
+                       Group=rep(c(1:num_clust12_24),num_list12_24))
+View(clust12_24_df)
+```
+
+
+```{r}
+new_corr = data_nut12_24_corr[ega_12_24[[16]],ega_12_24[[16]]]
+corr_order = data_nut12_24_corr[c(
+  ega_12_24[[1]],
+  ega_12_24[[2]],
+  ega_12_24[[3]],
+  ega_12_24[[4]],
+  ega_12_24[[5]],
+  ega_12_24[[6]],
+  ega_12_24[[7]],
+  ega_12_24[[8]],
+  ega_12_24[[9]],
+  ega_12_24[[10]],
+  ega_12_24[[11]],
+  ega_12_24[[12]],
+  ega_12_24[[13]],
+  ega_12_24[[14]],
+  ega_12_24[[15]],
+  ega_12_24[[16]]),c(
+  ega_12_24[[1]],
+  ega_12_24[[2]],
+  ega_12_24[[3]],
+  ega_12_24[[4]],
+  ega_12_24[[5]],
+  ega_12_24[[6]],
+  ega_12_24[[7]],
+  ega_12_24[[8]],
+  ega_12_24[[9]],
+  ega_12_24[[10]],
+  ega_12_24[[11]],
+  ega_12_24[[12]],
+  ega_12_24[[13]],
+  ega_12_24[[14]],
+  ega_12_24[[15]],
+  ega_12_24[[16]])]
+corrplot(corr_order,tl.cex = 0.5,
+         title = paste0("Correlation Matrix of", 16, "Cluster Nutrients for Children 12-24 Months"),
+         mar=c(0,0,1,0))
+corrplot(new_corr,tl.cex = 0.5,
+         title = paste0("Correlation Matrix of", 16, "Cluster Nutrients for Children 12-24 Months"),
+         mar=c(0,0,1,0))
+```
+
+## Confirmatory Factor Analysis
+
+### Store Clusters
+
+```{r}
+clusters_eq = c()
+```
+
+### Clust1
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "SolubleDietaryFiber+InsolubleDietaryFiber+Pectins+NaturalFolate+SyntheticFolate+Starch+AvailableCarbo+Betaine+Vegetable_Protein+Thiamin+Niacin+VitaminB6+Magnesium+Iron+Copper+Potassium+Phytic_Acid+Water+Manganese+Gluten")
+mod12_24_1 <- 
+  '
+  clust1=~SolubleDietaryFiber+InsolubleDietaryFiber+Pectins+NaturalFolate+SyntheticFolate+Starch+AvailableCarbo+Betaine+Vegetable_Protein+Thiamin+Niacin+VitaminB6+Magnesium+Iron+Copper+Potassium+Phytic_Acid+Water+Manganese+Gluten
+  Magnesium~~Potassium
+  InsolubleDietaryFiber~~Pectins
+  Betaine~~Gluten
+  SyntheticFolate~~Iron
+  Magnesium~~Manganese
+  Niacin~~VitaminB6
+  Starch~~Gluten
+  SolubleDietaryFiber~~Pectins
+  Potassium~~Phytic_Acid
+  Vegetable_Protein~~VitaminB6
+  Pectins~~Potassium
+  Niacin~~Iron
+  SyntheticFolate~~Thiamin
+  InsolubleDietaryFiber~~Manganese
+  SyntheticFolate~~VitaminB6
+  Starch~~Betaine
+  NaturalFolate~~Manganese
+  Vegetable_Protein~~Water
+  Starch~~AvailableCarbo
+  SyntheticFolate~~Water
+  Vegetable_Protein~~Potassium
+  Vegetable_Protein~~Copper
+  SolubleDietaryFiber~~InsolubleDietaryFiber
+  Thiamin~~Manganese
+  Thiamin~~Iron
+  NaturalFolate~~AvailableCarbo
+  NaturalFolate~~Starch
+  Starch~~Manganese
+  Vegetable_Protein~~Phytic_Acid
+  Copper~~Phytic_Acid
+  Pectins~~Copper
+  Water~~Manganese
+  Pectins~~Phytic_Acid
+  Phytic_Acid~~Manganese
+  Vegetable_Protein~~Gluten
+  VitaminB6~~Gluten
+  Thiamin~~Gluten
+  Starch~~Vegetable_Protein
+  Vegetable_Protein~~Manganese
+  AvailableCarbo~~Gluten
+  AvailableCarbo~~Potassium
+  Pectins~~AvailableCarbo
+  AvailableCarbo~~Phytic_Acid
+  VitaminB6~~Potassium
+  Potassium~~Water
+  InsolubleDietaryFiber~~Water
+  Starch~~Water
+  Thiamin~~Potassium
+  InsolubleDietaryFiber~~Thiamin
+  Starch~~Niacin
+  InsolubleDietaryFiber~~Copper
+  Betaine~~VitaminB6
+  Betaine~~Vegetable_Protein
+  Betaine~~Thiamin
+  VitaminB6~~Magnesium
+  Magnesium~~Water
+  Pectins~~VitaminB6
+  VitaminB6~~Phytic_Acid
+  SolubleDietaryFiber~~VitaminB6
+  VitaminB6~~Iron
+  InsolubleDietaryFiber~~SyntheticFolate
+  NaturalFolate~~Vegetable_Protein
+  SyntheticFolate~~Niacin
+  Betaine~~Copper
+  Thiamin~~Niacin
+  Thiamin~~VitaminB6
+  SolubleDietaryFiber~~NaturalFolate
+  Starch~~VitaminB6
+  Thiamin~~Water
+  SolubleDietaryFiber~~Magnesium
+  VitaminB6~~Copper
+  Starch~~Thiamin
+  Vegetable_Protein~~Thiamin
+  AvailableCarbo~~Thiamin
+  Pectins~~Gluten
+  AvailableCarbo~~Betaine
+  Thiamin~~Magnesium
+  InsolubleDietaryFiber~~Niacin
+  AvailableCarbo~~Magnesium
+  AvailableCarbo~~Water
+  SolubleDietaryFiber~~Copper
+  Niacin~~Manganese
+  SolubleDietaryFiber~~Water
+  Betaine~~Potassium
+  Iron~~Gluten
+  SyntheticFolate~~Betaine
+  SyntheticFolate~~Copper
+  Copper~~Water
+  SyntheticFolate~~Starch
+  Starch~~Iron
+  SolubleDietaryFiber~~Starch
+  SolubleDietaryFiber~~Phytic_Acid
+  InsolubleDietaryFiber~~Vegetable_Protein
+  Starch~~Copper
+  InsolubleDietaryFiber~~Phytic_Acid
+  Iron~~Phytic_Acid
+  InsolubleDietaryFiber~~NaturalFolate
+  Pectins~~NaturalFolate
+  Magnesium~~Phytic_Acid
+  NaturalFolate~~Potassium
+  NaturalFolate~~Thiamin
+  NaturalFolate~~Magnesium
+  NaturalFolate~~Niacin
+  NaturalFolate~~Water
+  Copper~~Gluten
+  Potassium~~Gluten
+  Potassium~~Manganese
+  SyntheticFolate~~Manganese
+  Magnesium~~Copper
+  NaturalFolate~~SyntheticFolate
+  AvailableCarbo~~Manganese
+  NaturalFolate~~Iron
+  InsolubleDietaryFiber~~VitaminB6
+  Betaine~~Phytic_Acid
+  Magnesium~~Gluten
+  Iron~~Manganese
+  Pectins~~Magnesium
+'
+fit12_24_1 <- cfa(mod12_24_1, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_1, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_1)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust1 = fascores[,"clust1"]
+temp12_24_1=parameterEstimates(fit12_24_1)
+choice = which(temp12_24_1$op=="=~")
+est12_24_1 = temp12_24_1$est[choice]
+name12_24_1 = temp12_24_1$rhs[choice]
+```
+
+### Clust2
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "SFA4.0+SFA6.0+SFA8.0+SFA10.0+SFA12.0+SFA14.0+SFA16.0+SFA17.0+SFA18.0+MUFA14.1+MUFA16.1+MUFA18.1+MUFA20.1+TRANS18.1+TRANS18.2+TRANS16.1+CLA_cis9+CLA_trans10+Solid_Fats")
+mod12_24_2 <- 
+  '
+  clust2=~SFA4.0+SFA6.0+SFA8.0+SFA10.0+SFA12.0+SFA14.0+SFA16.0+SFA17.0+SFA18.0+MUFA14.1+MUFA16.1+MUFA18.1+MUFA20.1+TRANS18.1+TRANS18.2+TRANS16.1+CLA_cis9+CLA_trans10+Solid_Fats
+  SFA16.0~~MUFA18.1
+  SFA6.0~~MUFA16.1
+  SFA17.0~~MUFA14.1
+  SFA10.0~~SFA14.0
+  SFA8.0~~SFA10.0
+  SFA4.0~~SFA6.0
+  CLA_cis9~~CLA_trans10
+  CLA_cis9~~Solid_Fats
+  MUFA14.1~~CLA_trans10
+  SFA8.0~~TRANS16.1
+  TRANS18.1~~TRANS18.2
+  SFA14.0~~CLA_cis9
+  MUFA18.1~~MUFA20.1
+  SFA16.0~~MUFA20.1
+  MUFA20.1~~TRANS16.1
+  SFA8.0~~TRANS18.1
+  SFA17.0~~SFA18.0
+  SFA4.0~~MUFA16.1
+  MUFA16.1~~Solid_Fats
+  SFA6.0~~SFA10.0
+  SFA4.0~~SFA8.0
+  SFA8.0~~SFA14.0
+  SFA10.0~~CLA_trans10
+  MUFA14.1~~TRANS18.1
+  SFA17.0~~TRANS18.2
+  MUFA14.1~~TRANS18.2
+  MUFA18.1~~TRANS18.1
+  SFA8.0~~MUFA20.1
+  SFA10.0~~MUFA16.1
+  SFA6.0~~SFA12.0
+  SFA14.0~~TRANS18.2
+  SFA14.0~~MUFA18.1
+  MUFA18.1~~CLA_trans10
+  SFA4.0~~SFA10.0
+  SFA4.0~~SFA14.0
+  SFA10.0~~SFA12.0
+  SFA12.0~~SFA14.0
+  SFA12.0~~Solid_Fats
+  SFA12.0~~CLA_trans10
+  SFA8.0~~SFA12.0
+  SFA4.0~~TRANS16.1
+  MUFA14.1~~TRANS16.1
+  SFA17.0~~TRANS16.1
+  SFA8.0~~Solid_Fats
+  SFA6.0~~TRANS16.1
+  SFA6.0~~SFA8.0
+  SFA6.0~~SFA14.0
+  SFA6.0~~TRANS18.1
+  MUFA16.1~~TRANS16.1
+  SFA8.0~~MUFA16.1
+  MUFA16.1~~MUFA20.1
+  SFA10.0~~MUFA20.1
+  SFA14.0~~SFA17.0
+  SFA18.0~~TRANS16.1
+  SFA8.0~~SFA18.0
+  SFA8.0~~MUFA14.1
+  SFA8.0~~SFA17.0
+  SFA10.0~~TRANS18.1
+  TRANS18.2~~CLA_cis9
+  SFA6.0~~CLA_cis9
+  SFA6.0~~CLA_trans10
+  SFA17.0~~CLA_cis9
+  SFA10.0~~SFA18.0
+  SFA17.0~~MUFA20.1
+  SFA16.0~~MUFA16.1
+  MUFA16.1~~MUFA18.1
+  MUFA20.1~~CLA_trans10
+  SFA4.0~~MUFA20.1
+  SFA18.0~~MUFA20.1
+  MUFA16.1~~TRANS18.1
+  MUFA14.1~~MUFA16.1
+  SFA16.0~~MUFA14.1
+  SFA6.0~~SFA18.0
+  TRANS18.1~~TRANS16.1
+  SFA4.0~~MUFA18.1
+  SFA8.0~~MUFA18.1
+  SFA4.0~~TRANS18.1
+  SFA12.0~~TRANS16.1
+  SFA14.0~~TRANS16.1
+  SFA4.0~~SFA12.0
+  SFA10.0~~TRANS18.2
+  SFA6.0~~MUFA18.1
+  SFA10.0~~MUFA18.1
+  SFA6.0~~MUFA20.1
+  SFA18.0~~MUFA18.1
+  SFA16.0~~SFA18.0
+  SFA18.0~~MUFA16.1
+  SFA18.0~~Solid_Fats
+  SFA18.0~~CLA_trans10
+  SFA17.0~~MUFA18.1
+  SFA12.0~~SFA17.0
+  SFA16.0~~TRANS18.1
+  MUFA14.1~~MUFA18.1
+  SFA10.0~~CLA_cis9
+  SFA4.0~~CLA_cis9
+  TRANS16.1~~Solid_Fats
+  SFA14.0~~SFA16.0
+  MUFA20.1~~Solid_Fats
+  SFA6.0~~Solid_Fats
+  CLA_trans10~~Solid_Fats
+  MUFA14.1~~CLA_cis9
+  SFA10.0~~MUFA14.1
+  MUFA16.1~~CLA_cis9
+  SFA18.0~~TRANS18.1
+  SFA8.0~~SFA16.0
+  SFA14.0~~MUFA14.1
+  SFA4.0~~CLA_trans10
+  SFA4.0~~Solid_Fats
+  TRANS18.1~~CLA_trans10
+  SFA18.0~~TRANS18.2
+  TRANS16.1~~CLA_cis9
+  SFA10.0~~TRANS16.1
+  MUFA18.1~~TRANS18.2
+  SFA14.0~~CLA_trans10
+  SFA17.0~~CLA_trans10
+  SFA14.0~~MUFA20.1
+  SFA16.0~~TRANS18.2
+  MUFA20.1~~TRANS18.1
+  MUFA20.1~~TRANS18.2
+'
+fit12_24_2 <- cfa(mod12_24_2, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_2, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_2)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust2 = fascores[,"clust2"]
+temp12_24_2=parameterEstimates(fit12_24_2)
+choice = which(temp12_24_2$op=="=~")
+est12_24_2 = temp12_24_2$est[choice]
+name12_24_2 = temp12_24_2$rhs[choice]
+```
+
+### Clust3
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Tryptophan+Threonine+Isoleucine+Leucine+Lysine+Methionine+Phenylalanine+Tyrosine+Valine+Histidine+Alanine+Aspartic_Acid+Glutamic_Acid+Proline+Serine+Animal_Protein+Nitrogen")
+mod12_24_3 <- 
+  '
+  clust3=~Tryptophan+Threonine+Isoleucine+Leucine+Lysine+Methionine+Phenylalanine+Tyrosine+Valine+Histidine+Alanine+Aspartic_Acid+Glutamic_Acid+Proline+Serine+Animal_Protein+Nitrogen
+  Phenylalanine~~Animal_Protein
+  Glutamic_Acid~~Proline
+  Glutamic_Acid~~Nitrogen
+  Tyrosine~~Alanine
+  Methionine~~Alanine
+  Alanine~~Aspartic_Acid
+  Threonine~~Isoleucine
+  Lysine~~Methionine
+  Methionine~~Animal_Protein
+  Tryptophan~~Lysine
+  Tryptophan~~Serine
+  Tyrosine~~Animal_Protein
+  Tryptophan~~Threonine
+  Valine~~Histidine
+  Isoleucine~~Lysine
+  Threonine~~Lysine
+  Glutamic_Acid~~Serine
+  Tyrosine~~Proline
+  Histidine~~Serine
+  Lysine~~Histidine
+  Tryptophan~~Histidine
+  Threonine~~Aspartic_Acid
+  Threonine~~Alanine
+  Isoleucine~~Leucine
+  Aspartic_Acid~~Serine
+  Methionine~~Phenylalanine
+  Isoleucine~~Serine
+  Isoleucine~~Nitrogen
+  Threonine~~Histidine
+  Histidine~~Nitrogen
+  Histidine~~Glutamic_Acid
+  Methionine~~Proline
+  Aspartic_Acid~~Nitrogen
+  Aspartic_Acid~~Proline
+  Threonine~~Tyrosine
+  Alanine~~Nitrogen
+  Threonine~~Methionine
+  Alanine~~Proline
+  Tyrosine~~Valine
+  Valine~~Alanine
+  Valine~~Proline
+  Valine~~Nitrogen
+  Tryptophan~~Proline
+  Tryptophan~~Isoleucine
+'
+fit12_24_3 <- cfa(mod12_24_3, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_3, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_3)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust3 = fascores[,"clust3"]
+temp12_24_3=parameterEstimates(fit12_24_3)
+choice = which(temp12_24_3$op=="=~")
+est12_24_3 = temp12_24_3$est[choice]
+name12_24_3 = temp12_24_3$rhs[choice]
+```
+
+
+### Clust4
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Galactose+Cystine+Arginine+Glycine+Phosphorus+Selenium+Sodium+Ash")
+mod12_24_4 <- 
+  '
+  clust4=~Galactose+Cystine+Arginine+Glycine+Phosphorus+Selenium+Sodium+Ash
+  Phosphorus~~Ash
+  Sodium~~Ash
+  Arginine~~Ash
+  Cystine~~Phosphorus
+  Cystine~~Ash
+  Phosphorus~~Sodium
+  Galactose~~Glycine
+  Arginine~~Glycine
+'
+fit12_24_4 <- cfa(mod12_24_4, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_4, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_4)
+hist(fascores)
+
+```
+
+```{r}
+data_nut12_24_scale$clust4 = fascores[,"clust4"]
+temp12_24_4=parameterEstimates(fit12_24_4)
+choice = which(temp12_24_4$op=="=~")
+est12_24_4 = temp12_24_4$est[choice]
+name12_24_4 = temp12_24_4$rhs[choice]
+```
+
+### Clust5
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Lactose+VitaminD3+Retinol+Riboflavin+Pantothenic_acid+VitaminB12+Calcium+Zinc")
+mod12_24_5 <- 
+  '
+  clust5=~Lactose+VitaminD3+Retinol+Riboflavin+Pantothenic_acid+VitaminB12+Calcium+Zinc
+  Lactose~~VitaminD3
+  VitaminB12~~Zinc
+  Retinol~~VitaminB12
+  Pantothenic_acid~~Calcium
+  Pantothenic_acid~~VitaminB12
+  Retinol~~Pantothenic_acid
+  VitaminD3~~Retinol
+  Lactose~~Zinc
+  VitaminD3~~Zinc
+  Lactose~~VitaminB12
+  Riboflavin~~VitaminB12
+'
+fit12_24_5 <- cfa(mod12_24_5, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_5, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_5)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust5 = fascores[,"clust5"]
+temp12_24_5=parameterEstimates(fit12_24_5)
+choice = which(temp12_24_5$op=="=~")
+est12_24_5 = temp12_24_5$est[choice]
+name12_24_5 = temp12_24_5$rhs[choice]
+```
+
+
+### Clust6
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Fructose+Glucose+Mannitol+Sorbitol+Xylitol")
+mod12_24_6 <- 
+  '
+  clust6=~b*Fructose+b*Glucose+a*Mannitol+a*Sorbitol+a*Xylitol
+  Fructose~~Glucose
+  Fructose~~Mannitol
+  Fructose~~Sorbitol
+  Glucose~~Mannitol
+  Sorbitol~~Xylitol
+'
+fit12_24_6 <- cfa(mod12_24_6, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_6, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_6)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust6 = fascores[,"clust6"]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale = data_nut12_24_scale[-which(data_nut12_24_scale$clust6>5),]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale$clust6 = scale(data_nut12_24_scale$clust6)
+temp12_24_6=parameterEstimates(fit12_24_6)
+choice = which(temp12_24_6$op=="=~")
+est12_24_6 = temp12_24_6$est[choice]
+name12_24_6 = temp12_24_6$rhs[choice]
+```
+
+### Clust7
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Maltose+Sucrose+AddSugars_AvailableCarbo+AddedSugars_TotalSugar")
+mod12_24_7 <- 
+  '
+  clust7=~b*Sucrose+b*Maltose+a*AddSugars_AvailableCarbo+a*AddedSugars_TotalSugar
+  Sucrose~~AddedSugars_TotalSugar
+  Maltose~~AddSugars_AvailableCarbo
+'
+fit12_24_7 <- cfa(mod12_24_7, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_7, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_7)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust7 = fascores[,"clust7"]
+temp12_24_7=parameterEstimates(fit12_24_7)
+choice = which(temp12_24_7$op=="=~")
+est12_24_7 = temp12_24_7$est[choice]
+name12_24_7 = temp12_24_7$rhs[choice]
+```
+
+### Clust8
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "SFA20.0+SFA22.0+Beta_Tocopherol")
+mod12_24_8 <- 
+  '
+  clust8=~Beta_Tocopherol+a*SFA20.0+a*SFA22.0
+  Beta_Tocopherol~~SFA20.0
+'
+fit12_24_8 <- cfa(mod12_24_8, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_8, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_8)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust8 = fascores[,"clust8"]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale = data_nut12_24_scale[-which(data_nut12_24_scale$clust8>5),]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale$clust8 = scale(data_nut12_24_scale$clust8)
+temp12_24_8=parameterEstimates(fit12_24_8)
+choice = which(temp12_24_8$op=="=~")
+est12_24_8 = temp12_24_8$est[choice]
+name12_24_8 = temp12_24_8$rhs[choice]
+```
+
+### Clust9
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Beta_Cryptoxanthin+VitaminC+Inositol")
+mod12_24_9 <- 
+  '
+  clust9=~Beta_Cryptoxanthin+VitaminC+Inositol
+  
+'
+fit12_24_9 <- cfa(mod12_24_9, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_9, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_9)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust9 = fascores[,"clust9"]
+temp12_24_9=parameterEstimates(fit12_24_9)
+choice = which(temp12_24_9$op=="=~")
+est12_24_9 = temp12_24_9$est[choice]
+name12_24_9 = temp12_24_9$rhs[choice]
+```
+
+### Clust10
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Lutein_Zeaxanthin+VitaminK+Oxalic_Acid")
+mod12_24_10 <- 
+  '
+  clust10=~Lutein_Zeaxanthin+VitaminK+Oxalic_Acid
+  
+'
+fit12_24_10 <- cfa(mod12_24_10, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_10, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_10)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust10 = fascores[,"clust10"]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale = data_nut12_24_scale[-which(data_nut12_24_scale$clust10>5),]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale$clust10 = scale(data_nut12_24_scale$clust10)
+temp12_24_10=parameterEstimates(fit12_24_10)
+choice = which(temp12_24_10$op=="=~")
+est12_24_10 = temp12_24_10$est[choice]
+name12_24_10 = temp12_24_10$rhs[choice]
+```
+
+
+### Clust11
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "PUFA18.2+Gamma_Tocopherol+Delta_Tocopherol")
+mod12_24_11 <- 
+  '
+  clust11=~PUFA18.2+a*Gamma_Tocopherol+a*Delta_Tocopherol
+  PUFA18.2~~Delta_Tocopherol
+'
+fit12_24_11 <- cfa(mod12_24_11, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_11, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_11)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust11 = fascores[,"clust11"]
+temp12_24_11=parameterEstimates(fit12_24_11)
+choice = which(temp12_24_11$op=="=~")
+est12_24_11 = temp12_24_11$est[choice]
+name12_24_11 = temp12_24_11$rhs[choice]
+```
+
+### Clust12
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "PUFA20.4+Choline+Cholesterol")
+mod12_24_12 <- 
+  '
+  clust12=~PUFA20.4+Choline+Cholesterol
+'
+fit12_24_12 <- cfa(mod12_24_12, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_12, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_12)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust12 = fascores[,"clust12"]
+temp12_24_12=parameterEstimates(fit12_24_12)
+choice = which(temp12_24_12$op=="=~")
+est12_24_12 = temp12_24_12$est[choice]
+name12_24_12 = temp12_24_12$rhs[choice]
+```
+
+### Clust13
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "PUFA18.3+PUFA18.3n3+Omega3_Fatty_Acids")
+mod12_24_13 <- 
+  '
+  clust13=~PUFA18.3+PUFA18.3n3+Omega3_Fatty_Acids
+  
+'
+fit12_24_13 <- cfa(mod12_24_13, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_13, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_13)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust13 = fascores[,"clust13"]
+temp12_24_13=parameterEstimates(fit12_24_13)
+choice = which(temp12_24_13$op=="=~")
+est12_24_13 = temp12_24_13$est[choice]
+name12_24_13 = temp12_24_13$rhs[choice]
+```
+
+### Clust14
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "VitaminE+Natural_Alpha_Tocopherol")
+mod12_24_14 <- 
+  '
+  clust14=~a*VitaminE+a*Natural_Alpha_Tocopherol
+  
+'
+fit12_24_14 <- cfa(mod12_24_14, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_14, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_14)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust14 = fascores[,"clust14"]
+temp12_24_14=parameterEstimates(fit12_24_14)
+choice = which(temp12_24_14$op=="=~")
+est12_24_14 = temp12_24_14$est[choice]
+name12_24_14 = temp12_24_14$rhs[choice]
+```
+
+
+### Clust15
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "Beta_Carotene+Alpha_Carotene")
+mod12_24_15 <- 
+  '
+  clust15=~a*Beta_Carotene+a*Alpha_Carotene
+  
+'
+fit12_24_15 <- cfa(mod12_24_15, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_15, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_15)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust15 = fascores[,"clust15"]
+temp12_24_15=parameterEstimates(fit12_24_15)
+choice = which(temp12_24_15$op=="=~")
+est12_24_15 = temp12_24_15$est[choice]
+name12_24_15 = temp12_24_15$rhs[choice]
+```
+
+### Clust16
+
+```{r}
+clusters_eq = c(clusters_eq,
+                "PUFA20.5+PUFA22.6")
+mod12_24_16 <- 
+  '
+  clust16=~a*PUFA20.5+a*PUFA22.6
+  
+'
+fit12_24_16 <- cfa(mod12_24_16, data = data_nut12_24_scale, check.gradient = TRUE)
+fitmeasures(fit12_24_16, c("cfi", "tli", "rmsea"))
+fascores = lavPredict(fit12_24_16)
+hist(fascores)
+```
+
+```{r}
+data_nut12_24_scale$clust16 = fascores[,"clust16"]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale = data_nut12_24_scale[-which(data_nut12_24_scale$clust16>5),]
+# row_id_num_summary(data_nut12_24_scale)
+# data_nut12_24_scale$clust16 = scale(data_nut12_24_scale$clust16)
+temp12_24_16=parameterEstimates(fit12_24_16)
+choice = which(temp12_24_16$op=="=~")
+est12_24_16 = temp12_24_16$est[choice]
+name12_24_16 = temp12_24_16$rhs[choice]
+```
+
+# Visualize the Latent Variables
+
+```{r}
+boxplot_df = data_nut12_24_scale %>% 
+              pivot_longer(cols = starts_with("clust"),
+                           names_prefix="clust",
+                           names_to="clust",values_to = "value")
+boxplot_df$clust = as.factor(as.integer(boxplot_df$clust))
+ggplot(boxplot_df, aes(x=clust, y=value)) + 
+  geom_boxplot(outlier.colour="red", outlier.shape=8,outlier.size=4) +
+  theme_classic() + 
+  labs(title = "Boxplot of Latent Variables Derived from Nutrients Within Each of the Clusters")
+```
+
+## Rescale the clusters for regression
+
+```{r}
+start_point = which(colnames(data_nut12_24_scale)=="clust1")
+data_nut12_24_scale[,c(start_point:(start_point+15))] = scale(data_nut12_24_scale[,c(start_point:(start_point+15))])
+boxplot_df = data_nut12_24_scale %>% 
+              pivot_longer(cols = starts_with("clust"),
+                           names_prefix="clust",
+                           names_to="clust",values_to = "value")
+boxplot_df$clust = as.factor(as.integer(boxplot_df$clust))
+ggplot(boxplot_df, aes(x=clust, y=value)) + 
+  geom_boxplot(outlier.colour="red", outlier.shape=8,outlier.size=4) +
+  theme_classic() + 
+  labs(title = "Boxplot of Latent Variables Derived from Nutrients Within Each of the Clusters")
+```
+
+## Analyze the correlation among clusters
+
+```{r}
+corr_clust = cor(data_nut12_24_scale[,c(start_point:(start_point+15))])
+corrplot(corr_clust,tl.cex = 0.5,
+         title = paste0("Correlation Matrix of ",ncol(corr_clust)," Clusters for Children 12-24 Months"),
+         mar=c(0,0,1,0))
+```
+
+# Merge Temperament Scores
+
+## Helper Function
+
+```{r match-temp-helper-func}
+match_temp = function(df, colname){
+  rows = nrow(df)
+  
+  ## Create "temperament" columns
+  df[[colname]] = NA
+
+  ## Match temperament score to each nutrient record and store it to temp_score
+  temp_score = rep(NA,rows)
+  temp_group = rep(NA,rows)
+  count = 0
+  for (i in 1:rows) {
+    merged = bqfc[which((bqfc$PID==df$CandID[i])),]
+    if(nrow(merged)==1){
+      #print(i)
+      age_diff = abs(merged$Age-df$age[i])
+      if(age_diff > 90){
+        count = count+1
+        } else {
+        temp_score[i] = as.numeric(merged[1,colname])
+        temp_group[i] = as.character(merged[1,"Group"])
+      }
+    } else if (nrow(merged)>1) {
+      age_diff = abs(merged$Age-df$age[i])
+      j = which(age_diff==min(age_diff))
+      if (age_diff[j]>90) {
+        count = count+1
+        # print(paste0(i,
+        #       " row's smallest age difference is larger than 60 days, difference is:",
+        #       age_diff[j]))
+      } else {
+        temp_score[i] = as.numeric(merged[j, colname])
+        temp_group[i] = as.character(merged[j,"Group"])
+      }
+    }
+  }
+  
+  ## Use temp_score to fill "temperament" column
+  df[[colname]] = temp_score
+  df[["Temp"]] = temp_group
+  
+  ## Summarize the information of temperament score
+  print(summary(temp_score))
+  print(count)
+  
+  return(df)
+}
+```
+
+
+## Merge Temperament SUR Score
+
+In this part, we merge the temp score to the `data_nut12_24_scale` dataframe and get `data_nut12_24_temp_sur`. Since temp score is not available for all the records, there should be expected to have some NAs in temp score. Therefore, we are going to remove NA's records and get `data_nut12_24_temp_sur_rmna`.
+
+```{r merge-temp-sur, results='asis'}
+## Match temp score to the nutrients
+data_nut12_24_temp_sur = match_temp(data_nut12_24_scale,"SUR")
+row_id_num_summary(data_nut12_24_temp_sur)
+## Remove NAs
+data_nut12_24_temp_sur_rmna = na.omit(data_nut12_24_temp_sur)
+row_id_num_summary(data_nut12_24_temp_sur_rmna)
+#View(data_nut12_24_temp_rmna)
+analysis_df_sur = data_nut12_24_temp_sur_rmna %>% select(-"groupid") %>% group_by(CandID) %>% arrange(CandID, age) %>% mutate(visitid = row_number()) %>% ungroup()
+#write.csv(analysis_df_sur, file = "sur_analysis_df.csv")
+```
+
+## Merge Temperament NEG Score
+
+In this part, we merge the temp score to the `data_nut12_24_scale` dataframe and get `data_nut12_24_temp_neg`. Since temp score is not available for all the records, there should be expected to have some NAs in temp score. Therefore, we are going to remove NA's records and get `data_nut12_24_temp_neg_rmna`.
+
+```{r merge-temp-neg, results='asis'}
+## Match temp score to the nutrients
+data_nut12_24_temp_neg = match_temp(data_nut12_24_scale,"NEG")
+row_id_num_summary(data_nut12_24_temp_neg)
+## Remove NAs
+data_nut12_24_temp_neg_rmna = na.omit(data_nut12_24_temp_neg)
+row_id_num_summary(data_nut12_24_temp_neg_rmna)
+#View(data_nut12_24_temp_rmna)
+analysis_df_neg = data_nut12_24_temp_neg_rmna %>% select(-"groupid") %>% group_by(CandID) %>% arrange(CandID, age) %>% mutate(visitid = row_number()) %>% ungroup()
+#write.csv(analysis_df_neg, file = "neg_analysis_df.csv")
+```
+
+## Merge Temperament REG Score
+
+In this part, we merge the temp score to the `data_nut12_24_scale` dataframe and get `data_nut12_24_temp_reg`. Since temp score is not available for all the records, there should be expected to have some NAs in temp score. Therefore, we are going to remove NA's records and get `data_nut12_24_temp_reg_rmna`.
+
+```{r merge-temp-reg, results='asis'}
+## Match temp score to the nutrients
+data_nut12_24_temp_reg = match_temp(data_nut12_24_scale,"REG")
+row_id_num_summary(data_nut12_24_temp_reg)
+## Remove NAs
+data_nut12_24_temp_reg_rmna = na.omit(data_nut12_24_temp_reg)
+row_id_num_summary(data_nut12_24_temp_reg_rmna)
+#View(data_nut12_24_temp_rmna)
+analysis_df_reg = data_nut12_24_temp_reg_rmna %>% select(-"groupid") %>% group_by(CandID) %>% arrange(CandID, age) %>% mutate(visitid = row_number()) %>% ungroup()
+#write.csv(analysis_df_reg, file = "reg_analysis_df.csv")
+```
+
+### Demographic information
+
+```{r}
+## Distribution of Visit
+table(analysis_df_sur$visitid)
+## Number of Subjects
+length(unique(analysis_df_sur$CandID))
+for (i in 1:7) {
+  print(paste0("This is ",i))
+  print(length(unique(analysis_df_sur$CandID)[which(analysis_df_sur$visitid==i)]))
+}
+## age
+mean(analysis_df_sur$age)
+sd(analysis_df_sur$age)
+for (i in 1:7) {
+  print(paste0("This is ",i))
+  print(as.numeric(analysis_df_sur %>% filter(visitid==i) %>% select(age) %>% summarise(meanage=mean(age),sdage=sd(age))))
+}
+## sex
+nrow(analysis_df_sur %>% filter(Sex=="Male") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(Sex=="Female") %>% select(CandID) %>% unique())
+analysis_df_sur %>% filter(Sex=="Male") %>% group_by(visitid) %>% summarize(n=n())
+analysis_df_sur %>% filter(Sex=="Female") %>% group_by(visitid) %>% summarize(n=n())
+## maternal education
+nrow(analysis_df_sur %>% filter(Education.Level==">grad") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(Education.Level=="<grad") %>% select(CandID) %>% unique())
+#View(analysis_df_sur %>% group_by(visitid, Education.Level) %>% summarize(n=n()) %>% arrange(Education.Level))
+## first four month breastfeeding
+table(analysis_df_sur %>% select(FirstFourMonthBreastfeeding))
+nrow(analysis_df_sur %>% filter(FirstFourMonthBreastfeeding=="exclusively_breastfed") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(FirstFourMonthBreastfeeding=="more_breastmilk") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(FirstFourMonthBreastfeeding=="others") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(FirstFourMonthBreastfeeding=="not_answered") %>% select(CandID) %>% unique())
+#View(analysis_df_sur %>% group_by(visitid, FirstFourMonthBreastfeeding) %>% summarize(n=n()) %>% arrange(FirstFourMonthBreastfeeding))
+## Energy
+mean(analysis_df_sur$energy*1000)
+sd(analysis_df_sur$energy*1000)
+for (i in 1:7) {
+  print(paste0("This is ",i))
+  print(as.numeric(analysis_df_sur %>% filter(visitid==i) %>% select(energy) %>% summarise(meanenergy=round(mean(energy*1000),1),sdenergy=round(sd(energy*1000),1))))
+}
+## Temperament
+nrow(analysis_df_sur %>% filter(Temp=="IBQR") %>% select(CandID) %>% unique())
+nrow(analysis_df_sur %>% filter(Temp=="ECBQ") %>% select(CandID) %>% unique())
+as.numeric(analysis_df_sur %>% filter(Temp=="IBQR") %>% select(age) %>% summarise(meanage=mean(age),sdage=sd(age)))
+as.numeric(analysis_df_sur %>% filter(Temp=="ECBQ") %>% select(age) %>% summarise(meanage=mean(age),sdage=sd(age)))
+mean(analysis_df_sur$SUR)
+sd(analysis_df_sur$SUR)
+mean(analysis_df_neg$NEG)
+sd(analysis_df_neg$NEG)
+mean(analysis_df_reg$REG)
+sd(analysis_df_reg$REG)
+mean(analysis_df_sur$SUR[analysis_df_sur$Temp=="IBQR"])
+sd(analysis_df_sur$SUR[analysis_df_sur$Temp=="IBQR"])
+mean(analysis_df_neg$NEG[analysis_df_neg$Temp=="IBQR"])
+sd(analysis_df_neg$NEG[analysis_df_neg$Temp=="IBQR"])
+mean(analysis_df_reg$REG[analysis_df_reg$Temp=="IBQR"])
+sd(analysis_df_reg$REG[analysis_df_reg$Temp=="IBQR"])
+mean(analysis_df_sur$SUR[analysis_df_sur$Temp=="ECBQ"])
+sd(analysis_df_sur$SUR[analysis_df_sur$Temp=="ECBQ"])
+mean(analysis_df_neg$NEG[analysis_df_neg$Temp=="ECBQ"])
+sd(analysis_df_neg$NEG[analysis_df_neg$Temp=="ECBQ"])
+mean(analysis_df_reg$REG[analysis_df_reg$Temp=="ECBQ"])
+sd(analysis_df_reg$REG[analysis_df_reg$Temp=="ECBQ"])
+```
+
+### Test for consistency of IBQR and ECBQ
+
+```{r}
+## SUR
+analysis_df_sur$Temp = as.factor(analysis_df_sur$Temp)
+analysis_df_sur$Temp = relevel(analysis_df_sur$Temp,"IBQR")
+mod_sur_p = lmer("SUR~Temp+
+                (1|CandID)",
+                analysis_df_sur,REML = TRUE)
+summary(mod_sur_p)
+## NEG
+analysis_df_neg$Temp = as.factor(analysis_df_neg$Temp)
+analysis_df_neg$Temp = relevel(analysis_df_neg$Temp,"IBQR")
+mod_neg_p = lmer("NEG~Temp+
+                (1|CandID)",
+                analysis_df_neg,REML = TRUE)
+summary(mod_neg_p)
+## REG
+analysis_df_reg$Temp = as.factor(analysis_df_reg$Temp)
+analysis_df_reg$Temp = relevel(analysis_df_reg$Temp,"IBQR")
+mod_reg_p = lmer("REG~Temp+
+                (1|CandID)",
+                analysis_df_reg,REML = TRUE)
+summary(mod_reg_p)
+```
+
+# Regression Analysis
+
+## Matrix to store the p-values
+
+```{r}
+row_names_clust = data_nut12_24_temp_sur_rmna %>% 
+  select(starts_with("clust")) %>% 
+  colnames()
+col_names_temp = c("SUR", "NEG", "REG")
+pval_adj_nut12_24_temp = as.data.frame(matrix(0,nrow = length(row_names_clust),
+                                              ncol = length(col_names_temp)),
+                                       row.names = row_names_clust)
+colnames(pval_adj_nut12_24_temp)=col_names_temp
+```
+
+## Matrix to store the estimates
+
+```{r}
+es_nut12_24_temp = as.data.frame(matrix(0,nrow = length(row_names_clust),
+                                ncol = length(col_names_temp)),
+                         row.names = row_names_clust)
+colnames(es_nut12_24_temp)=col_names_temp
+```
+
+## SUR
+
+```{r}
+#paste0(data_nut12_24_mullen_comp_rmna %>% select(starts_with("clust")) %>% colnames(), collapse = "+")
+mod_sur = lmer("SUR~Sex+Education.Level+
+                FirstFourMonthBreastfeeding+energy+
+                clust1+clust2+clust3+clust4+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+                clust12+clust13+clust14+clust15+clust16+
+                (1|CandID)",data_nut12_24_temp_sur_rmna,REML = TRUE)
+summary(mod_sur)
+# mod_sur = lmer("SUR~Sex+Education.Level+
+#                 FirstFourMonthBreastfeeding+energy+
+#                 clust1+clust2+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+#                 clust12+clust13+clust14+clust15+clust16+
+#                 (1|CandID)",
+#                 data_nut12_24_temp_sur_rmna,REML = TRUE)
+# summary(mod_sur)
+pval_adj_nut12_24_temp$SUR=as.numeric(
+  summary(mod_sur)$coefficients[row_names_clust,"Pr(>|t|)"])
+es_nut12_24_temp$SUR=as.numeric(
+  summary(mod_sur)$coefficients[row_names_clust,"Estimate"])
+```
+
+## NEG
+
+```{r}
+#paste0(data_nut12_24_mullen_comp_rmna %>% select(starts_with("clust")) %>% colnames(), collapse = "+")
+mod_neg = lmer("NEG~Sex+Education.Level+
+                FirstFourMonthBreastfeeding+energy+
+                clust1+clust2+clust3+clust4+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+                clust12+clust13+clust14+clust15+clust16+
+                (1|CandID)",
+                data_nut12_24_temp_neg_rmna,REML = TRUE)
+summary(mod_neg)
+# mod_neg = lmer("NEG~Sex+Education.Level+
+#                 FirstFourMonthBreastfeeding+energy+
+#                 clust1+clust2+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+#                 clust12+clust13+clust14+clust15+clust16+
+#                 (1|CandID)",
+#                 data_nut12_24_temp_neg_rmna,REML = TRUE)
+# summary(mod_neg)
+pval_adj_nut12_24_temp$NEG=as.numeric(
+  summary(mod_neg)$coefficients[row_names_clust,"Pr(>|t|)"])
+es_nut12_24_temp$NEG=as.numeric(
+  summary(mod_neg)$coefficients[row_names_clust,"Estimate"])
+```
+
+## REG
+
+```{r}
+#paste0(data_nut12_24_mullen_vr_rmna %>% select(starts_with("clust")) %>% colnames(), collapse = "+")
+mod_reg = lmer("REG~Sex+Education.Level+
+                FirstFourMonthBreastfeeding+energy+
+                clust1+clust2+clust3+clust4+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+                clust12+clust13+clust14+clust15+clust16+
+                (1|CandID)",
+                data_nut12_24_temp_reg_rmna,REML = TRUE)
+summary(mod_reg)
+# mod_reg = lmer("REG~Sex+Education.Level+
+#                 FirstFourMonthBreastfeeding+energy+
+#                 clust1+clust2+clust5+clust6+clust7+clust8+clust9+clust10+clust11+
+#                 clust12+clust13+clust14+clust15+clust16+
+#                 (1|CandID)",
+#                 data_nut12_24_temp_reg_rmna,REML = TRUE)
+# summary(mod_reg)
+pval_adj_nut12_24_temp$REG=as.numeric(
+  summary(mod_reg)$coefficients[row_names_clust,"Pr(>|t|)"])
+es_nut12_24_temp$REG=as.numeric(
+  summary(mod_reg)$coefficients[row_names_clust,"Estimate"])
+
+```
+
+## Adjust for P-value FDR Method
+
+```{r}
+pval_adj_nut12_24_temp_fdr = pval_adj_nut12_24_temp
+pval_adj_nut12_24_temp_fdr[,1:3]=t(apply(pval_adj_nut12_24_temp[,1:3], 1, p.adjust,"fdr"))
+pval_adj_nut12_24_temp_fdr$Nutrients=clusters_eq
+es_nut12_24_temp$Nutrients=clusters_eq
+print(pval_adj_nut12_24_temp_fdr)
+```
+
+
+
+
+
+
